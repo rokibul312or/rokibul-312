@@ -1,0 +1,154 @@
+name: Build and Release Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86, x64]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+        architecture: ${{ matrix.architecture }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller pillow
+      shell: powershell
+
+    - name: Create application icon
+      shell: powershell
+      run: |
+        python - << 'PY'
+        from PIL import Image, ImageDraw
+        import os
+        img = Image.new('RGBA', (256, 256), (70, 130, 250, 255))
+        d = ImageDraw.Draw(img)
+        d.rectangle([40,40,216,216], fill=(255,255,255,255), outline=(50,50,50,255), width=4)
+        d.rectangle([60,80,196,120], fill=(70,130,250,255))
+        d.rectangle([60,140,196,180], fill=(100,200,100,255))
+        os.makedirs('resources', exist_ok=True)
+        img.save('resources/app_icon.ico', format='ICO')
+        print('Icon created')
+        PY
+
+    - name: Build executable
+      shell: powershell
+      run: |
+        pyinstaller --name "Windows11-RDP-Manager-${{ matrix.architecture }}" `
+          --onefile `
+          --windowed `
+          --icon="resources/app_icon.ico" `
+          --hidden-import="PyQt5.sip" `
+          --hidden-import="requests" `
+          --hidden-import="urllib3" `
+          --distpath="dist/${{ matrix.architecture }}" `
+          --workpath="build/${{ matrix.architecture }}" `
+          --specpath="build/spec" `
+          src/main_app.py
+
+    - name: Create portable package (zip)
+      shell: powershell
+      run: |
+        New-Item -ItemType Directory -Force -Path "Windows11-RDP-Manager-${{ matrix.architecture }}-portable" | Out-Null
+        Copy-Item "dist\${{ matrix.architecture }}\Windows11-RDP-Manager-${{ matrix.architecture }}.exe" "Windows11-RDP-Manager-${{ matrix.architecture }}-portable\" -Force
+        @"
+RDP-Manager-anshuman960 - ${{ matrix.architecture }} Version
+
+1. Run Windows11-RDP-Manager-${{ matrix.architecture }}.exe
+2. Authenticate with GitHub (one-time)
+3. Enter your Tailscale auth key
+4. Click 'Start RDP Session'
+
+Get Tailscale auth key: https://login.tailscale.com/admin/settings/keys
+Project: https://github.com/anshuman960/windows-11-rdp
+"@ | Set-Content -Path "Windows11-RDP-Manager-${{ matrix.architecture }}-portable\README.txt"
+        Compress-Archive -Path "Windows11-RDP-Manager-${{ matrix.architecture }}-portable\*" -DestinationPath "Windows11-RDP-Manager-${{ matrix.architecture }}-portable.zip" -Force
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-${{ matrix.architecture }}-build
+        path: |
+          dist/${{ matrix.architecture }}/*.exe
+          Windows11-RDP-Manager-${{ matrix.architecture }}-portable.zip
+
+  create-release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+        merge-multiple: true
+
+    - name: Create release notes
+      id: release_notes
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/}
+        cat > release_notes.md << 'EOF'
+        ## Windows 11 RDP Manager $VERSION
+        
+        ### 🚀 Features
+        - Secure RDP via Tailscale VPN (no public endpoints)
+        - GitHub Actions automated Windows 11 RDP setup
+        - Cross-architecture builds (x86/x64)
+        - One-click desktop app UI (PyQt5)
+        
+        ### 📦 Downloads
+        Choose the version that matches your Windows system.
+        EOF
+        echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+        cat release_notes.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: "Windows 11 RDP Manager ${{ github.ref_name }}"
+        body: ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+        draft: false
+        prerelease: false
+        files: |
+          artifacts/Windows11-RDP-Manager-x86.exe
+          artifacts/Windows11-RDP-Manager-x86-portable.zip
+          artifacts/Windows11-RDP-Manager-x64.exe
+          artifacts/Windows11-RDP-Manager-x64-portable.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-completion:
+    needs: [build-windows, create-release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Build Summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "Architectures built: x86, x64" >> $GITHUB_STEP_SUMMARY
