@@ -1,0 +1,182 @@
+
+name: Build and Release Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86, x64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          architecture: ${{ matrix.architecture }}
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          }
+          pip install pyinstaller pillow
+          if ($LASTEXITCODE -ne 0) {
+            throw "Dependency installation failed"
+          }
+
+      - name: Create application icon
+        shell: pwsh
+        run: |
+          @'
+          from PIL import Image, ImageDraw
+          import os
+
+          os.makedirs("resources", exist_ok=True)
+          img = Image.new("RGBA", (256, 256), (70, 130, 250, 255))
+          d = ImageDraw.Draw(img)
+          d.rectangle([40, 40, 216, 216],
+                      fill=(255, 255, 255, 255),
+                      outline=(50, 50, 50, 255), width=4)
+          d.rectangle([60, 80, 196, 120], fill=(70, 130, 250, 255))
+          d.rectangle([60, 140, 196, 180], fill=(100, 200, 100, 255))
+          img.save("resources/app_icon.ico", format="ICO")
+          print("Icon created")
+          '@ | python -
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Icon generation failed"
+          }
+
+      - name: Verify application source
+        shell: pwsh
+        run: |
+          if (!(Test-Path "src/main_app.py")) {
+            throw "Missing src/main_app.py. Add your application source first."
+          }
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          $arch = "${{ matrix.architecture }}"
+
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --name "Windows11-RDP-Manager-$arch" `
+            --onefile `
+            --windowed `
+            --icon="resources/app_icon.ico" `
+            --hidden-import="PyQt5.sip" `
+            --hidden-import="requests" `
+            --hidden-import="urllib3" `
+            --distpath="dist/$arch" `
+            --workpath="build/$arch" `
+            --specpath="build/spec" `
+            src/main_app.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller build failed"
+          }
+
+      - name: Create portable package
+        shell: pwsh
+        run: |
+          $arch = "${{ matrix.architecture }}"
+          $folder = "Windows11-RDP-Manager-$arch-portable"
+          $exe = "Windows11-RDP-Manager-$arch.exe"
+
+          New-Item -ItemType Directory -Force -Path $folder |
+            Out-Null
+
+          Copy-Item "dist/$arch/$exe" "$folder/$exe" -Force
+
+          @"
+          Windows 11 RDP Manager - $arch
+
+          1. Run $exe
+          2. Authenticate using the application's supported GitHub flow.
+          3. Configure Tailscale only for an account and network you control.
+          4. Follow the application's setup instructions.
+
+          Review the source code before entering credentials or auth keys.
+          "@ | Set-Content -Path "$folder/README.txt"
+
+          Compress-Archive `
+            -Path "$folder/*" `
+            -DestinationPath "$folder.zip" `
+            -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.architecture }}-build
+          path: |
+            dist/${{ matrix.architecture }}/*.exe
+            Windows11-RDP-Manager-${{ matrix.architecture }}-portable.zip
+          if-no-files-found: error
+
+  create-release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+
+          cat > release_notes.md <<EOF
+          ## Windows 11 RDP Manager ${VERSION}
+
+          ### Features
+          - PyInstaller desktop application build
+          - x86 and x64 Windows builds
+          - Portable ZIP packages
+
+          ### Downloads
+          Download the executable or portable ZIP for your architecture.
+
+          Review the source and verify all remote-access settings before use.
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Windows 11 RDP Manager ${{ github.ref_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/Windows11-RDP-Manager-x86.exe
+            artifacts/Windows11-RDP-Manager-x86-portable.zip
+            artifacts/Windows11-RDP-Manager-x64.exe
+            artifacts/Windows11-RDP-Manager-x64-portable.zip
